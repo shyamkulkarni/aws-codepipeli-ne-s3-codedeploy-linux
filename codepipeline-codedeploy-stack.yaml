@@ -177,47 +177,38 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "Starting UserData script..."
+          
+          # Update and install packages
           yum update -y
-          yum install -y ruby wget amazon-cloudwatch-agent
+          yum install -y ruby wget httpd
+          
+          # Install CloudWatch agent
+          yum install -y amazon-cloudwatch-agent
           
           # Install CodeDeploy agent
           cd /home/ec2-user
           wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
           chmod +x ./install
           ./install auto
-          service codedeploy-agent start
+          systemctl enable codedeploy-agent
+          systemctl start codedeploy-agent
           
-          # Configure CloudWatch agent for Apache logs
-          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
-          {
-            "agent": {
-              "run_as_user": "root"
-            },
-            "logs": {
-              "logs_collected": {
-                "files": {
-                  "collect_list": [
-                    {
-                      "file_path": "/var/log/httpd/access_log",
-                      "log_group_name": "/codedeploy/apache/access",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/var/log/httpd/error_log",
-                      "log_group_name": "/codedeploy/apache/error",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    }
-                  ]
-                }
-              }
-            }
-          }
-          EOF
+          # Start Apache (so log files exist)
+          systemctl enable httpd
+          systemctl start httpd
+          
+          # Create CloudWatch agent config directory
+          mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+          
+          # Write CloudWatch agent config (using echo to avoid heredoc indentation issues)
+          echo '{"agent":{"run_as_user":"root"},"logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/httpd/access_log","log_group_name":"/codedeploy/apache/access","log_stream_name":"{instance_id}","timezone":"UTC"},{"file_path":"/var/log/httpd/error_log","log_group_name":"/codedeploy/apache/error","log_stream_name":"{instance_id}","timezone":"UTC"}]}}}}' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
           
           # Start CloudWatch agent
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          
+          echo "UserData script completed."
       Tags:
         - Key: Name
           Value: CodeDeploy-WebServer
