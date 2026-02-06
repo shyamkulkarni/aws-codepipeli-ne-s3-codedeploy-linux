@@ -1,5 +1,5 @@
 #!/bin/bash
-# Intentional error: calling non-existent command
-/usr/bin/nonexistent_command_that_will_fail
-exit 1
-
+isExistApp=$(pgrep httpd)
+if [[ -n $isExistApp ]]; then
+    service httpd stop
+fi
