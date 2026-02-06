@@ -1,12 +1,3 @@
 # Custom error documents
 ErrorDocument 500 /500.html
 ErrorDocument 503 /503.html
-
-# Enable RewriteEngine
-RewriteEngine On
-
-# Return 500 Internal Server Error for /broken path
-RewriteRule ^broken$ - [R=500,L]
-
-# Return 503 Service Unavailable for /unavailable path  
-RewriteRule ^unavailable$ - [R=503,L]

@@ -1,12 +1,9 @@
 #!/bin/bash
 
-# Enable AllowOverride for .htaccess files in /var/www/html
-cat > /etc/httpd/conf.d/allowoverride.conf << 'EOF'
-<Directory "/var/www/html">
-    AllowOverride All
-    Options FollowSymLinks
-</Directory>
-EOF
+# Install PHP if not present
+if ! command -v php &> /dev/null; then
+  yum install -y php
+fi
 
-# Restart Apache to apply changes
+# Restart Apache to load PHP module
 service httpd restart
