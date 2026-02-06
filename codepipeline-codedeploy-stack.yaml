@@ -138,6 +138,69 @@ Resources:
       LogGroupName: /codedeploy/apache/error
       RetentionInDays: 7
 
+  # ============================================
+  # 5xx Error Detection and Alerting
+  # ============================================
+
+  # Metric Filter to detect 5xx errors in Apache access logs
+  Apache5xxMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApacheAccessLogGroup
+      FilterPattern: '[ip, id, user, timestamp, request, status_code=5*, size, ...]'
+      MetricTransformations:
+        - MetricName: Apache5xxErrors
+          MetricNamespace: CodeDeploy/Apache
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  # CloudWatch Alarm for 5xx errors
+  Apache5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Apache-5xx-Errors
+      AlarmDescription: Alarm when Apache returns 5xx errors
+      MetricName: Apache5xxErrors
+      Namespace: CodeDeploy/Apache
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # EventBridge Rule for 5xx Error Alarm
+  Apache5xxAlarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DevOpsAgent-Apache5xxErrors
+      Description: Trigger DevOps Agent webhook when Apache 5xx errors are detected
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - Apache-5xx-Errors
+          state:
+            value:
+              - ALARM
+      State: ENABLED
+      Targets:
+        - Id: DevOpsAgentWebhook
+          Arn: !GetAtt DevOpsAgentWebhookFunction.Arn
+
+  # Lambda permission for 5xx Alarm EventBridge rule
+  EventBridgeLambdaPermission5xx:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevOpsAgentWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Apache5xxAlarmRule.Arn
+
   # IAM Role for EC2 (CodeDeploy Agent)
   EC2InstanceRole:
     Type: AWS::IAM::Role
@@ -214,6 +277,8 @@ Resources:
           Value: CodeDeploy-WebServer
         - Key: Environment
           Value: Production
+        - Key: Version
+          Value: "2"
 
   # CodeDeploy Application
   CodeDeployApplication:
@@ -576,6 +641,12 @@ Resources:
                   title = f"Deployment Failed: {detail.get('application', 'Unknown')}"
                   description = f"CodeDeploy deployment failed. Deployment ID: {detail.get('deploymentId', 'Unknown')}"
                   service = 'CodeDeploy'
+              elif 'CloudWatch Alarm' in detail_type:
+                  alarm_name = detail.get('alarmName', 'Unknown')
+                  priority = 'HIGH'
+                  title = f"Application Error: {alarm_name}"
+                  description = f"CloudWatch Alarm triggered: {alarm_name}. Reason: {detail.get('state', {}).get('reason', 'Unknown')}"
+                  service = 'CloudWatch'
               else:
                   priority = 'MEDIUM'
                   title = f"AWS Event: {detail_type}"
@@ -1008,3 +1079,13 @@ Outputs:
   DevOpsAgentIntegrationStatus:
     Description: DevOps Agent integration status
     Value: !If [HasDevOpsAgentWebhook, 'Configured - Events will be forwarded to DevOps Agent', 'Not configured - Provide DevOpsAgentWebhookUrl and DevOpsAgentSecretKey parameters']
+
+  Apache5xxAlarmArn:
+    Description: CloudWatch Alarm ARN for 5xx errors
+    Value: !GetAtt Apache5xxAlarm.Arn
+
+  Test5xxErrorEndpoints:
+    Description: URLs to test 5xx errors
+    Value: !Sub |
+      500 Error: http://${WebServerInstance.PublicIp}/broken
+      503 Error: http://${WebServerInstance.PublicIp}/unavailable
