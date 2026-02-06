@@ -1,9 +1,12 @@
 #!/bin/bash
 
-# Enable AllowOverride for .htaccess files
-if ! grep -q "AllowOverride All" /etc/httpd/conf/httpd.conf; then
-  sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/ s/AllowOverride None/AllowOverride All/' /etc/httpd/conf/httpd.conf
-fi
+# Enable AllowOverride for .htaccess files in /var/www/html
+cat > /etc/httpd/conf.d/allowoverride.conf << 'EOF'
+<Directory "/var/www/html">
+    AllowOverride All
+    Options FollowSymLinks
+</Directory>
+EOF
 
 # Restart Apache to apply changes
 service httpd restart
