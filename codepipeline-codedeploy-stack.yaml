@@ -29,8 +29,20 @@ Parameters:
     Default: ''
     Description: (Optional) EC2 Key Pair for SSH access
 
+  DevOpsAgentWebhookUrl:
+    Type: String
+    Description: DevOps Agent webhook URL (from DevOps Agent console)
+    Default: ''
+  
+  DevOpsAgentSecretKey:
+    Type: String
+    Description: DevOps Agent secret key for HMAC signing (from DevOps Agent console)
+    NoEcho: true
+    Default: ''
+
 Conditions:
   HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  HasDevOpsAgentWebhook: !Not [!Equals [!Ref DevOpsAgentWebhookUrl, '']]
 
 Mappings:
   RegionMap:
@@ -336,6 +348,642 @@ Resources:
                 - Name: SourceOutput
               RunOrder: 1
 
+  # ============================================
+  # DevOps Agent Webhook Infrastructure
+  # ============================================
+
+  # Secrets Manager secret for DevOps Agent credentials
+  DevOpsAgentSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasDevOpsAgentWebhook
+    Properties:
+      Name: !Sub 'DevOpsAgent-Webhook-Secret-${AWS::StackName}'
+      Description: DevOps Agent webhook URL and secret key for HMAC signing
+      SecretString: !Sub |
+        {
+          "webhookUrl": "${DevOpsAgentWebhookUrl}",
+          "secretKey": "${DevOpsAgentSecretKey}"
+        }
+
+  # DynamoDB table to store incident data
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: DevOpsAgent-Incidents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Lambda execution role for webhook handler
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WebhookLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt IncidentTable.Arn
+              - Effect: Allow
+                Action:
+                  - codepipeline:GetPipelineState
+                  - codepipeline:GetPipelineExecution
+                  - codedeploy:GetDeployment
+                  - codedeploy:ListDeployments
+                  - codedeploy:GetDeploymentInstance
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !If [HasDevOpsAgentWebhook, !Ref DevOpsAgentSecret, !Ref 'AWS::NoValue']
+
+  # Lambda function for DevOps Agent webhook
+  DevOpsAgentWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DevOpsAgent-Webhook
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref IncidentTable
+          PIPELINE_NAME: !Ref Pipeline
+          CODEDEPLOY_APP: !Ref CodeDeployApplication
+          DEPLOYMENT_GROUP: !Ref DeploymentGroup
+          GITHUB_REPO: !Sub '${GitHubRepoOwner}/${GitHubRepoName}'
+          DEVOPS_AGENT_SECRET_ARN: !If [HasDevOpsAgentWebhook, !Ref DevOpsAgentSecret, '']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import hmac
+          import hashlib
+          import base64
+          import urllib.request
+          import urllib.error
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          codepipeline = boto3.client('codepipeline')
+          codedeploy = boto3.client('codedeploy')
+          secretsmanager = boto3.client('secretsmanager')
+
+          # Cache for DevOps Agent credentials
+          _devops_agent_creds = None
+
+          def get_devops_agent_creds():
+              """Get DevOps Agent webhook URL and secret from Secrets Manager (cached)"""
+              global _devops_agent_creds
+              if _devops_agent_creds is None:
+                  secret_arn = os.environ.get('DEVOPS_AGENT_SECRET_ARN')
+                  if secret_arn:
+                      try:
+                          response = secretsmanager.get_secret_value(SecretId=secret_arn)
+                          _devops_agent_creds = json.loads(response['SecretString'])
+                      except Exception as e:
+                          print(f"Error getting DevOps Agent credentials: {e}")
+                          _devops_agent_creds = {}
+              return _devops_agent_creds or {}
+
+          def send_to_devops_agent(payload):
+              """Send event to DevOps Agent webhook with HMAC signature"""
+              creds = get_devops_agent_creds()
+              webhook_url = creds.get('webhookUrl')
+              secret_key = creds.get('secretKey')
+              
+              if not webhook_url:
+                  print("DevOps Agent webhook URL not configured")
+                  return None
+              
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+              payload_str = json.dumps(payload, default=str)
+              
+              # Generate HMAC signature
+              headers = {
+                  'Content-Type': 'application/json',
+                  'x-amzn-event-timestamp': timestamp
+              }
+              
+              if secret_key:
+                  message = f"{timestamp}:{payload_str}"
+                  signature = base64.b64encode(
+                      hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).digest()
+                  ).decode('utf-8')
+                  headers['x-amzn-event-signature'] = signature
+              
+              # Send to DevOps Agent
+              try:
+                  req = urllib.request.Request(
+                      webhook_url,
+                      data=payload_str.encode('utf-8'),
+                      headers=headers,
+                      method='POST'
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      response_body = resp.read().decode('utf-8')
+                      print(f"DevOps Agent response: {resp.status} - {response_body}")
+                      return {'status': resp.status, 'body': response_body}
+              except urllib.error.HTTPError as e:
+                  print(f"DevOps Agent HTTP error: {e.code} - {e.read().decode('utf-8')}")
+                  return {'error': str(e), 'status': e.code}
+              except Exception as e:
+                  print(f"Error sending to DevOps Agent: {e}")
+                  return {'error': str(e)}
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              # Handle different HTTP methods
+              http_method = event.get('httpMethod', 'POST')
+              path = event.get('path', '/')
+              
+              if http_method == 'GET' and path == '/health':
+                  creds = get_devops_agent_creds()
+                  return response(200, {
+                      'status': 'healthy',
+                      'service': 'DevOps Agent Webhook',
+                      'devopsAgentConfigured': bool(creds.get('webhookUrl'))
+                  })
+              
+              if http_method == 'GET' and path == '/incidents':
+                  return get_incidents()
+              
+              if http_method == 'GET' and path == '/status':
+                  return get_pipeline_status()
+              
+              if http_method == 'POST' and path == '/incident':
+                  body = json.loads(event.get('body', '{}'))
+                  return create_incident(body)
+              
+              if http_method == 'POST' and path == '/investigate':
+                  body = json.loads(event.get('body', '{}'))
+                  return investigate_incident(body)
+              
+              # Handle EventBridge events (pipeline failures)
+              if 'detail-type' in event:
+                  return handle_eventbridge(event)
+              
+              return response(200, {
+                  'message': 'DevOps Agent Webhook Ready',
+                  'endpoints': {
+                      'GET /health': 'Health check',
+                      'GET /status': 'Pipeline status',
+                      'GET /incidents': 'List incidents (DevOps Agent schema)',
+                      'POST /incident': 'Create incident',
+                      'POST /investigate': 'Trigger investigation'
+                  }
+              })
+
+          def handle_eventbridge(event):
+              """Handle EventBridge events for pipeline/deployment failures"""
+              detail_type = event.get('detail-type', '')
+              detail = event.get('detail', {})
+              
+              incident_id = f"INC-{int(time.time())}"
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+              
+              # Determine priority and title based on event type
+              if 'CodePipeline' in detail_type:
+                  priority = 'HIGH'
+                  title = f"Pipeline Failed: {detail.get('pipeline', 'Unknown')}"
+                  description = f"CodePipeline execution failed. State: {detail.get('state', 'FAILED')}"
+                  service = 'CodePipeline'
+              elif 'CodeDeploy' in detail_type:
+                  priority = 'CRITICAL'
+                  title = f"Deployment Failed: {detail.get('application', 'Unknown')}"
+                  description = f"CodeDeploy deployment failed. Deployment ID: {detail.get('deploymentId', 'Unknown')}"
+                  service = 'CodeDeploy'
+              else:
+                  priority = 'MEDIUM'
+                  title = f"AWS Event: {detail_type}"
+                  description = f"Event received from {event.get('source', 'unknown')}"
+                  service = event.get('source', 'AWS')
+              
+              # Get additional context
+              pipeline_context = None
+              deployment_context = None
+              if 'CodePipeline' in detail_type:
+                  pipeline_context = get_pipeline_context()
+              if 'CodeDeploy' in detail_type:
+                  deployment_context = get_deployment_context()
+              
+              # Store in DynamoDB (internal format)
+              internal_data = {
+                  'incidentId': incident_id,
+                  'timestamp': timestamp,
+                  'source': 'EventBridge',
+                  'type': detail_type,
+                  'status': 'OPEN',
+                  'priority': priority,
+                  'title': title,
+                  'description': description,
+                  'service': service,
+                  'detail': detail,
+                  'pipelineContext': pipeline_context,
+                  'deploymentContext': deployment_context,
+                  'ttl': int(time.time()) + 86400 * 7
+              }
+              
+              table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              table.put_item(Item=internal_data)
+              
+              print(f"Created incident: {incident_id}")
+              
+              # Build DevOps Agent schema format event
+              devops_agent_event = {
+                  'eventType': 'incident',
+                  'incidentId': incident_id,
+                  'action': 'created',
+                  'priority': priority,
+                  'title': title,
+                  'description': description,
+                  'timestamp': timestamp,
+                  'service': service,
+                  'data': {
+                      'eventBridgeDetail': detail,
+                      'pipelineContext': pipeline_context,
+                      'deploymentContext': deployment_context,
+                      'githubRepo': os.environ['GITHUB_REPO']
+                  }
+              }
+              
+              # Send to DevOps Agent webhook
+              devops_response = send_to_devops_agent(devops_agent_event)
+              
+              return response(200, {
+                  'incident': devops_agent_event,
+                  'devopsAgentResponse': devops_response
+              })
+
+          def get_pipeline_context():
+              """Get current pipeline state and recent execution details"""
+              try:
+                  pipeline_name = os.environ['PIPELINE_NAME']
+                  state = codepipeline.get_pipeline_state(name=pipeline_name)
+                  
+                  context = {
+                      'pipelineName': pipeline_name,
+                      'stages': []
+                  }
+                  
+                  for stage in state.get('stageStates', []):
+                      stage_info = {
+                          'name': stage.get('stageName'),
+                          'status': stage.get('latestExecution', {}).get('status'),
+                          'lastUpdated': str(stage.get('latestExecution', {}).get('lastUpdatedTime', ''))
+                      }
+                      context['stages'].append(stage_info)
+                  
+                  return context
+              except Exception as e:
+                  return {'error': str(e)}
+
+          def get_deployment_context():
+              """Get recent deployment details from CodeDeploy"""
+              try:
+                  app_name = os.environ['CODEDEPLOY_APP']
+                  dg_name = os.environ['DEPLOYMENT_GROUP']
+                  
+                  deployments = codedeploy.list_deployments(
+                      applicationName=app_name,
+                      deploymentGroupName=dg_name,
+                      includeOnlyStatuses=['Failed', 'Stopped']
+                  )
+                  
+                  if deployments.get('deployments'):
+                      deployment_id = deployments['deployments'][0]
+                      deployment = codedeploy.get_deployment(deploymentId=deployment_id)
+                      
+                      return {
+                          'deploymentId': deployment_id,
+                          'status': deployment['deploymentInfo'].get('status'),
+                          'errorInfo': deployment['deploymentInfo'].get('errorInformation', {}),
+                          'createTime': str(deployment['deploymentInfo'].get('createTime', ''))
+                      }
+                  
+                  return {'message': 'No failed deployments found'}
+              except Exception as e:
+                  return {'error': str(e)}
+
+          def get_pipeline_status():
+              """Get current pipeline status"""
+              context = get_pipeline_context()
+              deployment = get_deployment_context()
+              
+              return response(200, {
+                  'pipeline': context,
+                  'lastDeployment': deployment,
+                  'githubRepo': os.environ['GITHUB_REPO']
+              })
+
+          def get_incidents():
+              """List recent incidents in DevOps Agent schema format"""
+              table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              
+              result = table.scan(Limit=20)
+              
+              # Convert to DevOps Agent schema format
+              devops_agent_incidents = []
+              for item in result.get('Items', []):
+                  incident = {
+                      'eventType': 'incident',
+                      'incidentId': item.get('incidentId'),
+                      'action': 'updated' if item.get('status') == 'INVESTIGATING' else 'created',
+                      'priority': item.get('priority', 'MEDIUM'),
+                      'title': item.get('title', f"Incident {item.get('incidentId')}"),
+                      'description': item.get('description', ''),
+                      'timestamp': item.get('timestamp'),
+                      'service': item.get('service', 'Unknown'),
+                      'data': {
+                          'status': item.get('status'),
+                          'source': item.get('source'),
+                          'detail': item.get('detail'),
+                          'pipelineContext': item.get('pipelineContext'),
+                          'deploymentContext': item.get('deploymentContext')
+                      }
+                  }
+                  devops_agent_incidents.append(incident)
+              
+              devops_agent_incidents.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+              
+              return response(200, {'incidents': devops_agent_incidents})
+
+          def create_incident(body):
+              """Manually create an incident"""
+              incident_id = f"INC-{int(time.time())}"
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+              
+              priority = body.get('priority', 'MEDIUM')
+              title = body.get('title', f"Manual Incident {incident_id}")
+              description = body.get('description', '')
+              service = body.get('service', 'Manual')
+              
+              internal_data = {
+                  'incidentId': incident_id,
+                  'timestamp': timestamp,
+                  'source': 'Manual',
+                  'type': body.get('type', 'Manual'),
+                  'priority': priority,
+                  'title': title,
+                  'description': description,
+                  'service': service,
+                  'status': 'OPEN',
+                  'ttl': int(time.time()) + 86400 * 7
+              }
+              
+              table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              table.put_item(Item=internal_data)
+              
+              # Return DevOps Agent schema format
+              devops_agent_event = {
+                  'eventType': 'incident',
+                  'incidentId': incident_id,
+                  'action': 'created',
+                  'priority': priority,
+                  'title': title,
+                  'description': description,
+                  'timestamp': timestamp,
+                  'service': service,
+                  'data': body
+              }
+              
+              return response(201, devops_agent_event)
+
+          def investigate_incident(body):
+              """Generate investigation report for DevOps Agent"""
+              incident_id = body.get('incidentId')
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+              
+              # Gather all context
+              pipeline_context = get_pipeline_context()
+              deployment_context = get_deployment_context()
+              
+              recommendations = []
+              
+              # Analyze and add recommendations
+              if deployment_context.get('status') == 'Failed':
+                  error_info = deployment_context.get('errorInfo', {})
+                  error_code = error_info.get('code', '')
+                  
+                  if 'ScriptFailed' in error_code:
+                      recommendations.append({
+                          'type': 'CODE_FIX',
+                          'priority': 'HIGH',
+                          'description': 'Deployment script failed. Check scripts/ directory for syntax errors.',
+                          'suggestedFiles': ['scripts/stop_server', 'scripts/start_server', 'scripts/install_dependencies']
+                      })
+                  
+                  if 'InstanceAgent' in error_code:
+                      recommendations.append({
+                          'type': 'INFRASTRUCTURE',
+                          'priority': 'MEDIUM',
+                          'description': 'CodeDeploy agent issue on EC2 instance.'
+                      })
+              
+              # Update incident in DynamoDB
+              table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              try:
+                  table.update_item(
+                      Key={'incidentId': incident_id, 'timestamp': body.get('timestamp', timestamp)},
+                      UpdateExpression='SET investigation = :inv, #s = :status',
+                      ExpressionAttributeNames={'#s': 'status'},
+                      ExpressionAttributeValues={
+                          ':inv': {
+                              'pipeline': pipeline_context,
+                              'deployment': deployment_context,
+                              'recommendations': recommendations
+                          },
+                          ':status': 'INVESTIGATING'
+                      }
+                  )
+              except Exception as e:
+                  print(f"Error updating incident: {e}")
+              
+              # Return DevOps Agent schema format
+              devops_agent_event = {
+                  'eventType': 'incident',
+                  'incidentId': incident_id,
+                  'action': 'updated',
+                  'priority': 'HIGH',
+                  'title': f"Investigation: {incident_id}",
+                  'description': f"Investigation completed with {len(recommendations)} recommendations",
+                  'timestamp': timestamp,
+                  'service': 'DevOps-Agent-Webhook',
+                  'data': {
+                      'investigationTime': timestamp,
+                      'pipeline': pipeline_context,
+                      'deployment': deployment_context,
+                      'githubRepo': os.environ['GITHUB_REPO'],
+                      'recommendations': recommendations
+                  }
+              }
+              
+              return response(200, devops_agent_event)
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+
+  # API Gateway for webhook
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: DevOpsAgent-Webhook-API
+      Description: Webhook API for DevOps Agent integration
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource (proxy)
+  WebhookApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: '{proxy+}'
+
+  # API Gateway Method - ANY on proxy
+  WebhookApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref WebhookApiResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DevOpsAgentWebhookFunction.Arn}/invocations'
+
+  # API Gateway Method - ANY on root
+  WebhookApiRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !GetAtt WebhookApi.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DevOpsAgentWebhookFunction.Arn}/invocations'
+
+  # API Gateway Deployment
+  WebhookApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - WebhookApiMethod
+      - WebhookApiRootMethod
+    Properties:
+      RestApiId: !Ref WebhookApi
+      StageName: prod
+
+  # Lambda permission for API Gateway
+  WebhookLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevOpsAgentWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*'
+
+  # EventBridge Rule for Pipeline Failures
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DevOpsAgent-PipelineFailure
+      Description: Trigger DevOps Agent webhook on pipeline failures
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+        detail:
+          state:
+            - FAILED
+          pipeline:
+            - !Ref Pipeline
+      State: ENABLED
+      Targets:
+        - Id: DevOpsAgentWebhook
+          Arn: !GetAtt DevOpsAgentWebhookFunction.Arn
+
+  # EventBridge Rule for CodeDeploy Failures
+  DeploymentFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DevOpsAgent-DeploymentFailure
+      Description: Trigger DevOps Agent webhook on deployment failures
+      EventPattern:
+        source:
+          - aws.codedeploy
+        detail-type:
+          - CodeDeploy Deployment State-change Notification
+        detail:
+          state:
+            - FAILURE
+          application:
+            - !Ref CodeDeployApplication
+      State: ENABLED
+      Targets:
+        - Id: DevOpsAgentWebhook
+          Arn: !GetAtt DevOpsAgentWebhookFunction.Arn
+
+  # Lambda permission for EventBridge
+  EventBridgeLambdaPermissionPipeline:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevOpsAgentWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineFailureRule.Arn
+
+  EventBridgeLambdaPermissionDeploy:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevOpsAgentWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeploymentFailureRule.Arn
+
 Outputs:
   WebsiteURL:
     Description: URL of the deployed website
@@ -352,3 +1000,20 @@ Outputs:
   EC2PublicIP:
     Description: Public IP of the EC2 instance
     Value: !GetAtt WebServerInstance.PublicIp
+
+  DevOpsAgentWebhookURL:
+    Description: Webhook URL for DevOps Agent integration
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  WebhookEndpoints:
+    Description: Available webhook endpoints
+    Value: !Sub |
+      GET  /health     - Health check
+      GET  /status     - Pipeline and deployment status
+      GET  /incidents  - List incidents
+      POST /incident   - Create incident manually
+      POST /investigate - Trigger investigation
+
+  DevOpsAgentIntegrationStatus:
+    Description: DevOps Agent integration status
+    Value: !If [HasDevOpsAgentWebhook, 'Configured - Events will be forwarded to DevOps Agent', 'Not configured - Provide DevOpsAgentWebhookUrl and DevOpsAgentSecretKey parameters']
